@@ -1,6 +1,6 @@
-
-
-
+"""
+This file is an alternative approach to builing the 3-models using AutoML
+"""
 
 from sklearn.model_selection import train_test_split
 from dataPreprocessing import DataPreprocessing
