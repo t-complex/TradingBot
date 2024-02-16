@@ -1,49 +1,60 @@
 """
 This file serve as the model building for the trading bot
 This file will build 3 different model then ensemble them together
-Models: [Prophet, Bi-LSTM with MultiHeadAttention, Temporal Fusion Transformer, XGBoost]
+Models: [Prophet, NHiTSModel, Temporal Fusion Transformer, XGBoost]
 """
 
 import numpy as np
 import pandas as pd
+from joblib import dump
 from prophet import Prophet
-from keras.models import Sequential
-from keras.layers import LSTM, Dense, Bidirectional, MultiHeadAttention
+from keras.layers import Dense
 from pytorch_forecasting import TemporalFusionTransformer
 from xgboost import XGBRegressor
-from joblib import dump, load
-from sklearn.model_selection import GridSearchCV, train_test_split
+from darts.models import NHiTSModel
+from darts.dataprocessing.transformers import Scaler
+from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, mean_absolute_error, mean_absolute_percentage_error, r2_score
 from sklearn.ensemble import StackingRegressor, RandomForestRegressor
 from tensorflow.keras.callbacks import EarlyStopping
-from dataPreprocessing import DataPreprocessing
 import matplotlib.pyplot as plt
 
 class ModelBuilding:
-    def load_data(self, file_path):
-        train_data, val_data, test_data = DataPreprocessing.preprocess_data(file_path)
-        return train_data, val_data, test_data
-    def define_models(self, train_data, val_data, test_data, crypto):
+
+    def define_feature_importance(self, data, crypto):
         # Example using feature importances from a tree-based model
         features, target = ['open', 'high', 'low', 'Volume USD', f'Volume {crypto}'], 'close'
         forest = RandomForestRegressor()
-        forest.fit(train_data[features], train_data[target])
+        forest.fit(data[features], data[target])
         importances = forest.feature_importances_
-        important_features = features[np.argsort(importances)[-5:]]  # Select top 5 features
-        price_features = [feature for feature in important_features if feature in ['open', 'high', 'low']]
-        volume_features = [feature for feature in important_features if feature not in price_features]
-        target_variable = target
+        important_features = [features[i] for i in np.argsort(importances)[-5:]]  # Select top 5 features
+        X, y = data[important_features], data[target]
+        return X, y
 
+    def split_data(self, X, y, test_size=0.2):
+        time_series_split = TimeSeriesSplit(n_splits=3)
+        X_train_full, X_test, y_train_full, y_test = [], [], [], []
+        for train_index, test_index in time_series_split.split(X):
+            X_train_full, X_test = X[train_index], X[test_index]
+            y_train_full, y_test = y[train_index], y[test_index]
+        # Create a validation set from the end of the training set
+        val_size = int(test_size * len(X_train_full))
+        X_train, X_val = X_train_full[:-val_size], X_train_full[-val_size:]
+        y_train, y_val = y_train_full[:-val_size], y_train_full[-val_size:]
+        test_data = [X_test, y_test]
+        return X_train, X_val, y_train, y_val, test_data
+
+    def define_Prophet_model(self):
         # Prophet Model
         prophet_model = Prophet(seasonality_mode="multiplicative")
         prophet_model.add_seasonality(name="yearly", period=365, fourier_order=5)
-        # Bi-LSTM with MultiHeadAttention
-        bi_lstm_model = Sequential()
-        bi_lstm_model.add(Bidirectional(LSTM(64, return_sequences=True), input_shape=(train_data.shape[1], 1)))
-        bi_lstm_model.add(MultiHeadAttention(num_heads=8))
-        bi_lstm_model.add(Bidirectional(LSTM(32)))
-        bi_lstm_model.add(Dense(1))
-        bi_lstm_model.compile(loss="mse", optimizer="adam")
+        return prophet_model
+
+    def define_NHiTS_model(self):
+        nhits_model = NHiTSModel(input_chunk_length=168, output_chunk_length=120, random_state=42)
+        return nhits_model
+
+    def define_TFT_model(self, train_data):
         # Temporal Fusion Transformer
         transformer_model = TemporalFusionTransformer(
             input_shape=(train_data.shape[1], 1),
@@ -52,63 +63,39 @@ class ModelBuilding:
             # Adjust other model parameters here
         )
         transformer_model.compile(loss="mse", optimizer="adam")
+        return transformer_model
+
+    def define_XGBoost_model(self):
         # XGBoost
         xgb_model = XGBRegressor(objective="reg:squarederror", n_estimators=1000)
         xgb_model.compile(loss="mse")
-        # Fit individual models with early stopping while Repeat cross-validation for robustness
-        early_stopping = EarlyStopping(monitor="val_loss", patience=5)
-        X_train_for_ensemble_model, y_train_for_ensemble_model = [], []
-        for _ in range(3):
-            X_train, X_val, y_train, y_val = train_test_split(train_data, test_size=0.2, random_state=42)
-            X_train_for_ensemble_model, y_train_for_ensemble_model = X_train, y_train
-            X_train, y_train = train_data[price_features, volume_features], train_data[target_variable]
-            prophet_data = pd.DataFrame({'ds': X_train['date'], 'y': y_train})
-            prophet_model.fit(prophet_data)
-            bi_lstm_model.fit(
-                X_train, y_train, validation_data=(X_val, y_val), epochs=10, callbacks=[early_stopping]
-            )
-            transformer_model.fit(
-                X_train, y_train, validation_data=(X_val, y_val), epochs=10, callbacks=[early_stopping]
-            )
-            xgb_model.fit(
-                X_train[price_features, volume_features],
-                y_train,
-                early_stopping_rounds=10,
-                eval_set=[(X_val[price_features, volume_features], y_val)]
-            )
+        return xgb_model
 
+    def fitting_models(self, X_train, X_val, y_train, y_val, test_data, scaled_train, scaled_val, prophet_model, nhits_model, tft_model, xgb_model):
+        early_stopping = EarlyStopping(monitor="val_loss", min_delta=1e-4, patience=10, verbose=False, mode="min")
+        for _ in range(3):
+            prophet_data = pd.DataFrame({'ds': X_train['date'], 'y': y_train})
+            prophet_model.fit(prophet_data, validation_data=(X_val, y_val), epochs=50, callbacks=[early_stopping])
+            nhits_model.fit(scaled_train, validation_data=scaled_val, epochs=50, callbacks=[early_stopping])
+            tft_model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=50, callbacks=[early_stopping])
+            xgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], epochs=50, early_stopping_rounds=10)
         # Predict each model separately
         future = prophet_model.make_future_dataframe(periods=len(test_data))
         prophet_predictions = prophet_model.predict(future)["yhat"].squeeze()
-        lstm_predictions = bi_lstm_model.predict(test_data)
-        transformer_predictions = transformer_model.predict(test_data)["prediction"]
-        xgb_predictions = xgb_model.predict(test_data[price_features, volume_features])
-        # Evaluate each model
-        prophet_rmse = mean_squared_error(target_variable , prophet_predictions, squared=False)
-        bi_lstm_model_rmse = mean_squared_error(target_variable, lstm_predictions, squared=False)
-        transformer_rmse = mean_squared_error(target_variable, transformer_predictions, squared=False)
-        xgb_rmse = mean_squared_error(target_variable, xgb_predictions, squared=False)
-        # Print RMSE for each model
-        print(f"Prophet RMSE: {prophet_rmse}")
-        print(f"Bi-LSTM RMSE: {bi_lstm_model_rmse}")
-        print(f"Temporal Fusion RMSE: {transformer_rmse}")
-        print(f"XGBoost RMSE: {xgb_rmse}")
-        # Plot the results
-        plt.figure(figsize=(12, 6))
-        plt.plot(target_variable, label='True Values')
-        plt.plot(prophet_predictions, label='Prophet Forecast')
-        plt.plot(lstm_predictions, label='Bi-LSTM Forecast')
-        plt.plot(transformer_predictions, label='Temporal Fusion Forecast')
-        plt.plot(xgb_predictions, label='XGBoost Forecast')
-        plt.legend()
-        plt.show()
+        scaled_pred_nhits = nhits_model.predict(n=120)
+        nhits_predictions = train_scaler.inverse_transform(scaled_pred_nhits)
+        tft_predictions = tft_model.predict(test_data)["prediction"]
+        xgb_predictions = xgb_model.predict(test_data)
+        return prophet_predictions, nhits_predictions, tft_predictions, xgb_predictions
 
+    def define_ensemble_model(self, X_train, y_train, test_data, prophet_predictions,
+                              nhits_predictions, tft_predictions, xgb_predictions, crypto):
         # Define ensemble model using StackingRegressor
         ensemble_model = StackingRegressor(
             estimators=[
                 ('prophet', prophet_model),
-                ('bi-lstm', bi_lstm_model),
-                ('transformer', transformer_model),
+                ('nhits_lstm', nhits_model),
+                ('transformer', tft_model),
                 ('xgb', xgb_model)
             ],
             final_estimator=Dense(1),
@@ -117,7 +104,7 @@ class ModelBuilding:
 
         # Combine predictions (adjust weights as needed)
         ensemble_predictions = np.average(
-            [prophet_predictions, lstm_predictions, transformer_predictions, xgb_predictions],
+            [prophet_predictions, nhits_predictions, tft_predictions, xgb_predictions],
             axis=0,
             weights=[0.3, 0.25, 0.2, 0.25])
         # Evaluate ensemble model performance, Calculate and print additional metrics
@@ -185,38 +172,82 @@ class ModelBuilding:
         )
 
         # Fit and evaluate ensemble model
-        grid_search.fit(train_data[price_features, volume_features], train_data[target_variable])
-        predictions = grid_search.predict(test_data[price_features, volume_features])
+        grid_search.fit(X_train, y_train)
+        predictions = grid_search.predict(test_data)
         print(f'Best parameters: {grid_search.best_params_}')
         print(f'Best score: {grid_search.best_score_}')
 
         ensemble_model.set_params(**grid_search.best_params_)
-        ensemble_model.fit(X_train_for_ensemble_model, y_train_for_ensemble_model)
+        ensemble_model.fit(X_train, y_train)
 
         # Save individual models and the ensemble model
-        dump(prophet_predictions, "prophet_model.joblib")
-        dump(lstm_predictions, "lstm_model.joblib")
-        dump(transformer_predictions, "transformer_model.joblib")
-        dump(xgb_predictions, "xgb_model.joblib")
-        dump(ensemble_model, "ensemble_model.joblib")
+        dump(prophet_predictions, f'{crypto}-prophet_model.joblib')
+        dump(nhits_predictions, f'{crypto}-nhits_model.joblib')
+        dump(tft_predictions, f'{crypto}-tft_model.joblib')
+        dump(xgb_predictions, f'{crypto}-xgb_model.joblib')
+        dump(ensemble_model, f'{crypto}-ensemble_model.joblib')
+
+        return predictions
+
+
+if __name__ == '__main__':
+    mb = ModelBuilding()
+    cryptos = ['BTC', 'ETH', 'USDT', 'BNB', 'SOL', 'ADA', 'DOGE']
+
+    for crypto in cryptos:
+        data = pd.read_csv(f'{crypto}-USD.csv')
+        X, y = mb.define_feature_importance(data, crypto)
+        X_train, X_val, y_train, y_val, test_data = mb.split_data(X, y)
+        train_data, target = [X_train, y_train], data['close']
+        prophet_model = mb.define_Prophet_model()
+        train_scaler, validate_scaler = Scaler(), Scaler()
+        scaled_train = train_scaler.fit_transform(train_data)
+        scaled_val = validate_scaler.fit_transform([X_val, y_val])
+        nhits_model = mb.define_NHiTS_model()
+        tft_model = mb.define_TFT_model(train_data)
+        xgb_model = mb.define_XGBoost_model()
+        (prophet_predictions, nhits_predictions,
+         tft_predictions, xgb_predictions) = mb.fitting_models(X_train, X_val, y_train, y_val, test_data,
+                                                               scaled_train, scaled_val, prophet_model,
+                                                               nhits_model, tft_model, xgb_model)
+
+        # Evaluate each model
+        prophet_rmse = mean_squared_error(target, prophet_predictions, squared=False)
+        bi_lstm_model_rmse = mean_squared_error(target, nhits_predictions, squared=False)
+        transformer_rmse = mean_squared_error(target, tft_predictions, squared=False)
+        xgb_rmse = mean_squared_error(target, xgb_predictions, squared=False)
+        # Print RMSE for each model
+        print(f"Prophet RMSE: {prophet_rmse}")
+        print(f"Bi-LSTM RMSE: {bi_lstm_model_rmse}")
+        print(f"Temporal Fusion RMSE: {transformer_rmse}")
+        print(f"XGBoost RMSE: {xgb_rmse}")
+        # Plot the results
+        plt.figure(figsize=(12, 6))
+        plt.plot(target, label='True Values')
+        plt.plot(prophet_predictions, label='Prophet Forecast')
+        plt.plot(nhits_predictions, label='Time2Vec-BiLSTM Forecast')
+        plt.plot(tft_predictions, label='Temporal Fusion Forecast')
+        plt.plot(xgb_predictions, label='XGBoost Forecast')
+        plt.legend()
+        plt.show()
+
+        ensemble_model_predictions = mb.define_ensemble_model(X_train, y_train, test_data, prophet_predictions,
+                                 nhits_predictions, tft_predictions, xgb_predictions, crypto)
+
         # Load models later
-        loaded_prophet = load("prophet_model.joblib")
-        loaded_ensemble = load("ensemble_model.joblib")
+        # loaded_prophet = load("prophet_model.joblib")
+        # loaded_ensemble = load("ensemble_model.joblib")
         # Plot the performance of the models
         plt.figure(figsize=(12, 6))
-        plt.plot(test_data['Close'], label="True")
-        plt.plot(ensemble_predictions, label="Ensemble")
+        plt.plot(test_data, label="True")
+        plt.plot(ensemble_model_predictions, label="Ensemble")
         plt.legend()
         plt.title("Performance of Models")
         plt.show()
         # Save the results
-        submission_df = pd.DataFrame({"id": test_data["id"], "target": ensemble_predictions.flatten()})
-        submission_df.to_csv("submission.csv", index=False)
+        submission_df = pd.DataFrame({"id": test_data, "target": ensemble_model_predictions.flatten()})
+        submission_df.to_csv(f'{crypto}-submission.csv', index=False)
 
-if __name__ == '__main__':
-    mb = ModelBuilding()
-    train_BTC_data, val_BTC_data, test_BTC_data = mb.load_data("data/BTC-USD.csv")
-    train_ETH_data, val_ETH_data, test_ETH_data = mb.load_data("data/ETH-USD.csv")
 
-    mb.define_models(train_BTC_data, val_BTC_data, test_BTC_data, "BTC")
-    mb.define_models(train_ETH_data, val_ETH_data, test_ETH_data, "ETH")
+
+
