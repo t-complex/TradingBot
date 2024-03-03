@@ -4,10 +4,14 @@ Now, let’s start building our trading strategies.
 We’ll create a simple moving average crossover strategy and backtest it to evaluate its performance.
 """
 import math
+
+import pandas as pd
 from termcolor import colored as cl
 import matplotlib.pyplot as plt
 from sklearn.model_selection import ParameterGrid
 class BacktestStrategy:
+    def __init__(self, data):
+        self.data = data
     def backtest(self, data):
         strategy_returns = data['close'].pct_change()
         strategy_cumulative_returns = (1 + strategy_returns).cumprod()
@@ -67,3 +71,14 @@ class BacktestStrategy:
         earning = round(equity - investment, 2)
         roi = round(earning / investment * 100, 2)
         print(cl(f'EARNING: ${earning} ; ROI: {roi}%', attrs=['bold']))
+    def backtest_advance_indicator(self):
+        df = self.data.dropna().reset_index(drop=True)
+        shifted_features = []
+        for i in range(20):
+            for feature in ['Close', 'Volume', 'BOLU', 'RSI', '%K', '%D', 'EMA_10', 'EMA_20', 'ATR', 'ADX']:
+                shifted_feature = df[feature].shift(i)
+                shifted_feature.name = f'{feature}_{i}d_ago'
+                shifted_features.append(shifted_feature)
+        df_shifted = pd.concat(shifted_features, axis=1)
+        df = pd.concat([df, df_shifted], axis=1)
+        return df

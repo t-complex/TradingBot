@@ -12,7 +12,6 @@ import tensorflow as tf
 from joblib import dump
 from scipy import signal
 from prophet import Prophet
-from keras.models import Model
 from xgboost import XGBRegressor
 from darts.models import NHiTSModel
 from hyperopt import hp, tpe, Trials
@@ -20,20 +19,30 @@ from Time2VecLayer import Time2VecLayer
 # from mlxtend.classifier import StratifiedTimeSeriesSplit
 from sklearn.ensemble import StackingRegressor, RandomForestRegressor
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense, LSTM, Bidirectional
 from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.model_selection import TimeSeriesSplit
 from darts.dataprocessing.transformers import Scaler
 from pytorch_forecasting import TemporalFusionTransformer
 from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
-from keras.layers import Dense, Input , LSTM, Bidirectional
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import matplotlib.pyplot as plt
 
 class ModelsML:
     def define_Prophet_model(self):
-        # Prophet Model
-        prophet_model = Prophet(seasonality_mode="multiplicative")
+        # prophet_model = Prophet(seasonality_mode="multiplicative")
+        prophet_model = Prophet(
+            changepoint_prior_scale=0.05,
+            holidays_prior_scale=15,
+            seasonality_prior_scale=10,
+            weekly_seasonality=True,
+            yearly_seasonality=True,
+            daily_seasonality=False
+        )
+        prophet_model.add_country_holidays(country_name='US')
         prophet_model.add_seasonality(name="yearly", period=365, fourier_order=5)
+        prophet_model.make_future_dataframe(periods=365)
         return prophet_model
     def define_NHiTS_model(self):
         nhits_model = NHiTSModel(input_chunk_length=168, output_chunk_length=120, random_state=42)
@@ -60,16 +69,31 @@ class ModelsML:
         xgb_model = XGBRegressor(objective="reg:squarederror", n_estimators=1000)
         xgb_model.compile(loss="mse")
         return xgb_model
+    def define_autoencoder_model(self):
+        input_dim = train_data.shape[1]
+        input_layer = Input(shape=(input_dim,))
+        encoder = Dense(64, activation='relu')(input_layer)
+        encoder = Dense(32, activation='relu')(encoder)
+        encoder_output = Dense(16, activation='relu')(encoder)
+        decoder = Dense(32, activation='relu')(encoder_output)
+        decoder = Dense(64, activation='relu')(decoder)
+        decoder_output = Dense(input_dim, activation='sigmoid')(decoder)
+        # Autoencoder
+        autoencoder = Model(inputs=input_layer, outputs=decoder_output)
+        autoencoder.compile(optimizer='adam', loss='mean_squared_error')
+        return autoencoder
     def fitting_models(self, X_train, X_val, y_train, y_val, test_data, scaled_train,
-                       scaled_val, prophet_model, nhits_model, t2v_model , tft_model, xgb_model):
+                       scaled_val, prophet_model, nhits_model, t2v_model , tft_model, xgb_model, autoencoder_model):
         early_stopping = EarlyStopping(monitor="val_loss", min_delta=1e-4, patience=10, verbose=False, mode="min")
         for _ in range(3):
             prophet_data = pd.DataFrame({'ds': X_train['date'], 'y': y_train})
-            prophet_model.fit(prophet_data, validation_data=(X_val, y_val), epochs=50, callbacks=[early_stopping])
-            nhits_model.fit(scaled_train, validation_data=scaled_val, epochs=50, callbacks=[early_stopping])
-            t2v_model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=50, callbacks=[early_stopping])
-            tft_model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=50, callbacks=[early_stopping])
-            xgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], epochs=50, early_stopping_rounds=10)
+            prophet_model.fit(prophet_data, validation_data=(X_val, y_val), epochs=100, batch_size=32, callbacks=[early_stopping])
+            nhits_model.fit(scaled_train, validation_data=scaled_val, epochs=100, batch_size=32, callbacks=[early_stopping])
+            t2v_model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=100, batch_size=32, callbacks=[early_stopping])
+            tft_model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=100, batch_size=32, callbacks=[early_stopping])
+            xgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], epochs=100, batch_size=32, early_stopping_rounds=10)
+            autoencoder_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], epochs=100,
+                                                                        batch_size=32,callbacks=[early_stopping])
         # Predict each model separately
         train_scaler = StandardScaler()
         future = prophet_model.make_future_dataframe(periods=len(test_data))
